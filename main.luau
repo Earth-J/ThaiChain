@@ -1,8 +1,9 @@
--- WordChain Helper | v3.1 (Custom UI Tracker Added) | Large Dynamic Island UI
+-- WordChain Helper | v3.7 (Added Speed Control Popup & Human Typing Speed Adjuster)
 
 local Players       = game:GetService("Players")
 local TweenService  = game:GetService("TweenService")
 local UIS           = game:GetService("UserInputService")
+local VIM           = game:GetService("VirtualInputManager") 
 local LP            = Players.LocalPlayer
 local PGui          = LP:WaitForChild("PlayerGui")
 
@@ -12,36 +13,32 @@ local CFG = {
     MIN_LEN     = 1,
     MAX_LEN     = 40,
     MAX_SUGGEST = 30,
-
-    -- ความยาวคำแนะนำขั้นต่ำ (หน่วย: ตัวอักษรไทย) ปรับได้จาก UI ด้วยปุ่ม -/+
     MIN_SUGGEST_CHARS = 6,
 
-    -- ตั้งค่าคีย์ลัดที่นี่ (Keyboard Shortcuts)
-    KEY_REMOVE  = Enum.KeyCode.LeftAlt, -- แนะนำใช้ Alt ซ้าย จะกดง่ายสุดตอนกำลังพิมพ์
-    KEY_RESET   = Enum.KeyCode.Delete,
+    -- ความเร็วในการพิมพ์ (วินาทีต่อ 1 ตัวอักษร) ยิ่งน้อยยิ่งพิมพ์ไว
+    TYPING_SPEED_MIN = 0.02,
+    TYPING_SPEED_MAX = 0.12,
 
-    -- ═══ ระบบเก็บคำที่ถูกใช้ไปแล้ว (Used-word tracker) ═══
-    TRACK_USED           = true,  -- เปิด/ปิดระบบ
-    HISTORY_VISIBLE_ONLY = true,  -- นับเฉพาะ label ที่มองเห็นอยู่จริง (ไม่นับ UI ที่ซ่อนอยู่)
-    CLEAR_AFTER_EMPTY    = 8,     -- history log ว่างต่อเนื่องกี่วินาที = จบรอบ → ล้างคำที่ใช้แล้ว (0 = ไม่ล้างอัตโนมัติ)
-    LOG_STRIP_PREFIX     = true,  -- บรรทัดที่มี ":" ให้เอาเฉพาะข้างหลัง (ตัดชื่อผู้เล่นใน "ชื่อ: คำ")
-    KEY_DUMP             = Enum.KeyCode.Insert, -- dump path/ข้อความของ label ภาษาไทยทั้งหมด (print + copy ลง clipboard)
+    KEY_REMOVE   = Enum.KeyCode.LeftAlt, 
+    KEY_RESET    = Enum.KeyCode.Delete,
+    KEY_AUTOFILL = Enum.KeyCode.Tab, 
+    KEY_DUMP     = Enum.KeyCode.Insert, 
+
+    TRACK_USED           = true,  
+    HISTORY_VISIBLE_ONLY = true,  
+    CLEAR_AFTER_EMPTY    = 8,     
+    LOG_STRIP_PREFIX     = true,  
 }
+
+local CURRENT_SPEED_DELAY = 0.05 -- ค่าเริ่มต้นความหน่วงต่อตัวอักษร
 
 local PATH_WHITELIST = { "InputBar", "Match", "GameWord", "CurrentWord", "WordDisplay" }
 local PATH_BLACKLIST = { "Menu", "Settings", "Lobby", "Profile", "Button", "Mode", "Code" }
 
--- ═══ HISTORY LOG (ประวัติคำบนโต๊ะ) ═══
-local HISTORY_SOURCES = {}
 local HISTORY_KEYWORDS = { "History", "UsedWords", "WordLog", "WordList" }
 
--- ════════════════════════════════════════════
---  WORD DB
--- ════════════════════════════════════════════
 local SOURCE_URL = "https://raw.githubusercontent.com/PyThaiNLP/pythainlp/dev/pythainlp/corpus/words_th.txt"
 local CACHE_PATH = "WordDB_ptnlp.txt"
-
--- คลังความถี่คำ (Thai National Corpus)
 local FREQ_SOURCE_URL = "https://raw.githubusercontent.com/PyThaiNLP/pythainlp/dev/pythainlp/corpus/tnc_freq.txt"
 local FREQ_CACHE_PATH = "WordFreq_tnc.txt"
 
@@ -59,9 +56,7 @@ local function isThaiOnlyWord(word)
     if len == 0 or len % 3 ~= 0 then return false end
     for i = 1, len, 3 do
         local b1, b2, b3 = word:byte(i, i + 2)
-        if b1 ~= 0xE0 or (b2 ~= 0xB8 and b2 ~= 0xB9) or not b3 or b3 < 0x80 or b3 > 0xBF then
-            return false
-        end
+        if b1 ~= 0xE0 or (b2 ~= 0xB8 and b2 ~= 0xB9) or not b3 or b3 < 0x80 or b3 > 0xBF then return false end
     end
     return true
 end
@@ -85,30 +80,22 @@ local function buildFreqDB(text)
     local freq = {}
     for line in text:gmatch("[^\n\r]+") do
         local word, countStr = line:match("^(.-)\t(%d+)%s*$")
-        if word and countStr then
-            freq[word] = tonumber(countStr)
-        end
+        if word and countStr then freq[word] = tonumber(countStr) end
     end
     return freq
 end
-
-local WORD_DB
-local WORD_FREQ
 
 local function loadWordDB()
     if isfile and isfile(CACHE_PATH) then
         local ok, cached = pcall(readfile, CACHE_PATH)
         if ok and cached and #cached > 500 then
             local db = buildDB(cached)
-            local n = 0
-            for _, v in pairs(db) do n = n + #v end
+            local n = 0; for _, v in pairs(db) do n = n + #v end
             if n > 1000 then return db end
         end
     end
     local ok, body = pcall(function() return game:HttpGet(SOURCE_URL) end)
-    if not ok or not body or #body < 500 then
-        return {}
-    end
+    if not ok or not body or #body < 500 then return {} end
     if writefile then pcall(writefile, CACHE_PATH, body) end
     return buildDB(body)
 end
@@ -118,59 +105,34 @@ local function loadFreqDB()
         local ok, cached = pcall(readfile, FREQ_CACHE_PATH)
         if ok and cached and #cached > 500 then
             local freq = buildFreqDB(cached)
-            local n = 0
-            for _ in pairs(freq) do n = n + 1 end
+            local n = 0; for _ in pairs(freq) do n = n + 1 end
             if n > 1000 then return freq end
         end
     end
     local ok, body = pcall(function() return game:HttpGet(FREQ_SOURCE_URL) end)
-    if not ok or not body or #body < 500 then
-        return {}
-    end
+    if not ok or not body or #body < 500 then return {} end
     if writefile then pcall(writefile, FREQ_CACHE_PATH, body) end
     return buildFreqDB(body)
 end
 
-WORD_DB   = loadWordDB()
+local WORD_DB   = loadWordDB()
 WORD_FREQ = loadFreqDB()
 
--- ════════════════════════════════════════════
---  BLACKLIST
--- ════════════════════════════════════════════
 local blacklisted = {}
 local usedWords = {}
 local usedCount = 0
-
--- ════════════════════════════════════════════
---  UTF-8 HELPERS
--- ════════════════════════════════════════════
-local function lastChar(str)
-    local i = #str
-    while i >= 1 do
-        local b = str:byte(i)
-        if b < 0x80 or b >= 0xC0 then
-            if b >= 0xE0 then return str:sub(i, i + 2)
-            else return str:sub(i, i) end
-        end
-        i = i - 1
-    end
-    return nil
-end
+local isAutoFillON = false 
+local isTyping = false     
 
 local function utf8Len(str)
     local n = 0
     for i = 1, #str do
         local b = str:byte(i)
-        if b < 0x80 or b >= 0xC0 then
-            n = n + 1
-        end
+        if b < 0x80 or b >= 0xC0 then n = n + 1 end
     end
     return n
 end
 
--- ════════════════════════════════════════════
---  SUGGESTION ENGINE
--- ════════════════════════════════════════════
 local function getSuggestions(prefix)
     local plen = #prefix
     local out  = {}
@@ -180,7 +142,6 @@ local function getSuggestions(prefix)
     if not bucket then return out end
 
     local minChars = CFG.MIN_SUGGEST_CHARS
-
     for _, w in ipairs(bucket) do
         if #w > plen and w:sub(1, plen) == prefix and not blacklisted[w] and not usedWords[w] and utf8Len(w) >= minChars then
             table.insert(out, w)
@@ -190,28 +151,21 @@ local function getSuggestions(prefix)
     table.sort(out, function(a, b)
         local fa = WORD_FREQ[a] or 0
         local fb = WORD_FREQ[b] or 0
-        if fa ~= fb then
-            return fa > fb
-        end
+        if fa ~= fb then return fa > fb end
         return #a < #b
     end)
 
     local result = {}
-    for i = 1, math.min(#out, CFG.MAX_SUGGEST) do
-        result[i] = out[i]
-    end
+    for i = 1, math.min(#out, CFG.MAX_SUGGEST) do result[i] = out[i] end
     return result
 end
 
--- ════════════════════════════════════════════
---  STATE
--- ════════════════════════════════════════════
 local lastWord           = ""
 local currentSuggestions = {}
 local currentIndex       = 1
 
 -- ════════════════════════════════════════════
---  GUI — DYNAMIC ISLAND
+--  GUI & STYLING
 -- ════════════════════════════════════════════
 local COLORS = {
     bg        = Color3.fromHex("0D0D0D"),
@@ -223,227 +177,232 @@ local COLORS = {
     del_txt   = Color3.fromHex("FF6B6B"),
     rst_bg    = Color3.fromHex("101E1A"),
     rst_txt   = Color3.fromHex("4CFFE8"),
-    lastchar  = Color3.fromHex("FFB347"),
     set_bg    = Color3.fromHex("14181C"),
     set_txt   = Color3.fromHex("AEB4BA"),
+    auto_txt  = Color3.fromHex("44FF77"),
+    auto_on   = Color3.fromHex("2E7D32"),
+    popup_bg  = Color3.fromHex("161616"),
 }
 
-if PGui:FindFirstChild("WC_Helper") then
-    PGui:FindFirstChild("WC_Helper"):Destroy()
-end
+if PGui:FindFirstChild("WC_Helper") then PGui:FindFirstChild("WC_Helper"):Destroy() end
+local gui = Instance.new("ScreenGui", PGui)
+gui.Name, gui.ResetOnSpawn, gui.ZIndexBehavior, gui.IgnoreGuiInset = "WC_Helper", false, Enum.ZIndexBehavior.Sibling, true
 
-local gui = Instance.new("ScreenGui")
-gui.Name           = "WC_Helper"
-gui.ResetOnSpawn   = false
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.IgnoreGuiInset = true
-gui.Parent         = PGui
-
-local island = Instance.new("Frame")
-island.Name             = "DynamicIsland"
-island.AnchorPoint      = Vector2.new(0.5, 0)
-island.Position         = UDim2.new(0.5, 0, 0, -100)
-island.Size             = UDim2.new(0, 0, 0, 52)
-island.AutomaticSize    = Enum.AutomaticSize.X
+local island = Instance.new("Frame", gui)
+island.AnchorPoint, island.Position, island.Size, island.AutomaticSize = Vector2.new(0.5, 0), UDim2.new(0.5, 0, 0, -100), UDim2.new(0, 0, 0, 52), Enum.AutomaticSize.X
 island.BackgroundColor3 = COLORS.bg
-island.BorderSizePixel  = 0
-island.Parent           = gui
+Instance.new("UICorner", island).CornerRadius = UDim.new(0, 26)
+local stroke = Instance.new("UIStroke", island); stroke.Color, stroke.Thickness = COLORS.border, 1
+local pad = Instance.new("UIPadding", island); pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 14), UDim.new(0, 14)
+local layout = Instance.new("UIListLayout", island)
+layout.FillDirection, layout.VerticalAlignment, layout.Padding, layout.SortOrder = Enum.FillDirection.Horizontal, Enum.VerticalAlignment.Center, UDim.new(0, 12), Enum.SortOrder.LayoutOrder
 
-local islandCorner = Instance.new("UICorner", island)
-islandCorner.CornerRadius = UDim.new(0, 26)
-
-local islandStroke = Instance.new("UIStroke", island)
-islandStroke.Color     = COLORS.border
-islandStroke.Thickness = 1
-
-local islandPadding = Instance.new("UIPadding", island)
-islandPadding.PaddingLeft   = UDim.new(0, 14)
-islandPadding.PaddingRight  = UDim.new(0, 14)
-
-local islandLayout = Instance.new("UIListLayout", island)
-islandLayout.FillDirection      = Enum.FillDirection.Horizontal
-islandLayout.VerticalAlignment  = Enum.VerticalAlignment.Center
-islandLayout.Padding            = UDim.new(0, 12)
-islandLayout.SortOrder          = Enum.SortOrder.LayoutOrder
-
-local badge = Instance.new("Frame")
-badge.Size             = UDim2.new(0, 36, 0, 36)
-badge.BackgroundColor3 = COLORS.accent
-badge.BorderSizePixel  = 0
-badge.LayoutOrder      = 1
-badge.Parent           = island
+local badge = Instance.new("Frame", island)
+badge.Size, badge.BackgroundColor3, badge.LayoutOrder = UDim2.new(0, 36, 0, 36), COLORS.accent, 1
 Instance.new("UICorner", badge).CornerRadius = UDim.new(1, 0)
-
 local badgeScale = Instance.new("UIScale", badge)
+local badgeLabel = Instance.new("TextLabel", badge)
+badgeLabel.Size, badgeLabel.BackgroundTransparency, badgeLabel.Font, badgeLabel.TextSize, badgeLabel.TextColor3, badgeLabel.Text = UDim2.new(1, 0, 1, 0), 1, Enum.Font.GothamBold, 16, COLORS.bg, "W"
 
-local badgeLabel = Instance.new("TextLabel")
-badgeLabel.Size              = UDim2.new(1, 0, 1, 0)
-badgeLabel.BackgroundTransparency = 1
-badgeLabel.Font              = Enum.Font.GothamBold
-badgeLabel.TextSize          = 16
-badgeLabel.TextColor3        = COLORS.bg
-badgeLabel.Text              = "W"
-badgeLabel.Parent            = badge
+local textStack = Instance.new("Frame", island)
+textStack.BackgroundTransparency, textStack.Size, textStack.AutomaticSize, textStack.LayoutOrder = 1, UDim2.new(0, 0, 0, 42), Enum.AutomaticSize.X, 2
+local stackLayout = Instance.new("UIListLayout", textStack); stackLayout.FillDirection, stackLayout.SortOrder = Enum.FillDirection.Vertical, Enum.SortOrder.LayoutOrder
 
-local textStack = Instance.new("Frame")
-textStack.BackgroundTransparency = 1
-textStack.Size           = UDim2.new(0, 0, 0, 42)
-textStack.AutomaticSize  = Enum.AutomaticSize.X
-textStack.LayoutOrder    = 2
-textStack.Parent         = island
+local subtitleLabel = Instance.new("TextLabel", textStack)
+subtitleLabel.Size, subtitleLabel.AutomaticSize, subtitleLabel.BackgroundTransparency, subtitleLabel.Font, subtitleLabel.TextSize, subtitleLabel.TextColor3, subtitleLabel.Text = UDim2.new(0, 0, 0, 14), Enum.AutomaticSize.X, 1, Enum.Font.Gotham, 11, COLORS.dim, "สถานะ"
 
-local stackLayout = Instance.new("UIListLayout", textStack)
-stackLayout.FillDirection     = Enum.FillDirection.Vertical
-stackLayout.SortOrder         = Enum.SortOrder.LayoutOrder
-stackLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+local wordRow = Instance.new("Frame", textStack)
+wordRow.BackgroundTransparency, wordRow.Size, wordRow.AutomaticSize = 1, UDim2.new(0, 0, 0, 24), Enum.AutomaticSize.X
+local wordRowLayout = Instance.new("UIListLayout", wordRow); wordRowLayout.FillDirection, wordRowLayout.Padding = Enum.FillDirection.Horizontal, UDim.new(0, 6)
 
-local subtitleLabel = Instance.new("TextLabel")
-subtitleLabel.Size              = UDim2.new(0, 0, 0, 14)
-subtitleLabel.AutomaticSize     = Enum.AutomaticSize.X
-subtitleLabel.BackgroundTransparency = 1
-subtitleLabel.Font              = Enum.Font.Gotham
-subtitleLabel.TextSize          = 11
-subtitleLabel.TextColor3        = COLORS.dim
-subtitleLabel.TextXAlignment    = Enum.TextXAlignment.Left
-subtitleLabel.Text              = "สถานะ"
-subtitleLabel.LayoutOrder       = 1
-subtitleLabel.Parent            = textStack
+local wordLabel = Instance.new("TextLabel", wordRow)
+wordLabel.Size, wordLabel.AutomaticSize, wordLabel.BackgroundTransparency, wordLabel.Font, wordLabel.TextSize, wordLabel.TextColor3, wordLabel.Text = UDim2.new(0, 0, 1, 0), Enum.AutomaticSize.X, 1, Enum.Font.GothamBold, 18, COLORS.text, "รอคำจากเกม..."
 
-local wordRow = Instance.new("Frame")
-wordRow.BackgroundTransparency = 1
-wordRow.Size            = UDim2.new(0, 0, 0, 24)
-wordRow.AutomaticSize   = Enum.AutomaticSize.X
-wordRow.LayoutOrder     = 2
-wordRow.Parent          = textStack
-
-local wordRowLayout = Instance.new("UIListLayout", wordRow)
-wordRowLayout.FillDirection     = Enum.FillDirection.Horizontal
-wordRowLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-wordRowLayout.Padding           = UDim.new(0, 6)
-
-local wordLabel = Instance.new("TextLabel")
-wordLabel.Size              = UDim2.new(0, 0, 1, 0)
-wordLabel.AutomaticSize      = Enum.AutomaticSize.X
-wordLabel.BackgroundTransparency = 1
-wordLabel.Font              = Enum.Font.GothamBold
-wordLabel.TextSize          = 18
-wordLabel.TextColor3        = COLORS.text
-wordLabel.TextXAlignment    = Enum.TextXAlignment.Left
-wordLabel.Text              = "รอคำจากเกม..."
-wordLabel.LayoutOrder       = 1
-wordLabel.Parent            = wordRow
-
-local lastCharChip = Instance.new("TextLabel")
-lastCharChip.Size              = UDim2.new(0, 0, 1, 0)
-lastCharChip.AutomaticSize      = Enum.AutomaticSize.X
-lastCharChip.BackgroundTransparency = 1
-lastCharChip.Font              = Enum.Font.GothamBold
-lastCharChip.TextSize          = 14
-lastCharChip.TextColor3        = COLORS.lastchar
-lastCharChip.TextXAlignment    = Enum.TextXAlignment.Left
-lastCharChip.Text              = ""
-lastCharChip.LayoutOrder       = 2
-lastCharChip.Parent            = wordRow
+local autoHintChip = Instance.new("TextLabel", wordRow)
+autoHintChip.Size, autoHintChip.AutomaticSize, autoHintChip.BackgroundTransparency, autoHintChip.Font, autoHintChip.TextSize, autoHintChip.TextColor3, autoHintChip.Text = UDim2.new(0, 0, 1, 0), Enum.AutomaticSize.X, 1, Enum.Font.GothamBold, 14, COLORS.auto_txt, ""
 
 local function makeIconButton(iconAssetId, fallbackText, bgColor, iconColor, order)
-    local btn = Instance.new("ImageButton")
-    btn.Size             = UDim2.new(0, 34, 0, 34)
-    btn.BackgroundColor3 = bgColor
-    btn.BorderSizePixel  = 0
-    btn.AutoButtonColor  = false
-    btn.LayoutOrder      = order
-    btn.Visible          = false
-    btn.Parent           = island
+    local btn = Instance.new("ImageButton", island)
+    btn.Size, btn.BackgroundColor3, btn.AutoButtonColor, btn.LayoutOrder, btn.Visible = UDim2.new(0, 34, 0, 34), bgColor, false, order, false
     Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
-
-    local btnScale = Instance.new("UIScale", btn)
-
-    local stroke = Instance.new("UIStroke", btn)
-    stroke.Color        = Color3.new(1, 1, 1)
-    stroke.Transparency = 0.9
-    stroke.Thickness    = 1
-
+    local scale = Instance.new("UIScale", btn)
+    local txt
     if iconAssetId and iconAssetId ~= "" then
-        local img = Instance.new("ImageLabel")
-        img.Size                   = UDim2.new(0, 16, 0, 16)
-        img.AnchorPoint            = Vector2.new(0.5, 0.5)
-        img.Position               = UDim2.new(0.5, 0, 0.5, 0)
-        img.BackgroundTransparency = 1
-        img.Image                  = iconAssetId
-        img.ImageColor3            = iconColor
-        img.Parent                 = btn
+        local img = Instance.new("ImageLabel", btn)
+        img.Size, img.AnchorPoint, img.Position, img.BackgroundTransparency, img.Image, img.ImageColor3 = UDim2.new(0, 16, 0, 16), Vector2.new(0.5, 0.5), UDim2.new(0.5, 0, 0.5, 0), 1, iconAssetId, iconColor
     else
-        local txt = Instance.new("TextLabel")
-        txt.Size                   = UDim2.new(1, 0, 1, 0)
-        txt.BackgroundTransparency = 1
-        txt.Font                   = Enum.Font.GothamBold
-        txt.TextSize               = 14
-        txt.TextColor3             = iconColor
-        txt.Text                   = fallbackText
-        txt.Parent                 = btn
+        txt = Instance.new("TextLabel", btn)
+        txt.Size, txt.BackgroundTransparency, txt.Font, txt.TextSize, txt.TextColor3, txt.Text = UDim2.new(1, 0, 1, 0), 1, Enum.Font.GothamBold, 14, iconColor, fallbackText
     end
-
-    btn.MouseEnter:Connect(function()
-        TweenService:Create(btnScale, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.1}):Play()
-    end)
-    btn.MouseLeave:Connect(function()
-        TweenService:Create(btnScale, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.0}):Play()
-    end)
-    btn.MouseButton1Down:Connect(function()
-        TweenService:Create(btnScale, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.9}):Play()
-    end)
-    btn.MouseButton1Up:Connect(function()
-        TweenService:Create(btnScale, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.1}):Play()
-    end)
-
-    return btn, btnScale
+    btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.1}):Play() end)
+    btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.0}):Play() end)
+    btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.9}):Play() end)
+    btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.1}):Play() end)
+    return btn, scale, txt
 end
 
-local lenMinusBtn, lenMinusScale = makeIconButton("", "-", COLORS.set_bg, COLORS.set_txt, 3)
-lenMinusBtn.Visible = true
-
-local lenLabel = Instance.new("TextLabel")
-lenLabel.Size              = UDim2.new(0, 20, 0, 34)
-lenLabel.BackgroundTransparency = 1
-lenLabel.Font              = Enum.Font.GothamBold
-lenLabel.TextSize          = 14
-lenLabel.TextColor3        = COLORS.text
-lenLabel.TextXAlignment    = Enum.TextXAlignment.Center
-lenLabel.Text              = tostring(CFG.MIN_SUGGEST_CHARS)
-lenLabel.LayoutOrder       = 4
-lenLabel.Parent            = island
-
-local lenPlusBtn, lenPlusScale = makeIconButton("", "+", COLORS.set_bg, COLORS.set_txt, 5)
-lenPlusBtn.Visible = true
+local lenMinusBtn, lenMinusScale = makeIconButton("", "-", COLORS.set_bg, COLORS.set_txt, 3); lenMinusBtn.Visible = true
+local lenLabel = Instance.new("TextLabel", island)
+lenLabel.Size, lenLabel.BackgroundTransparency, lenLabel.Font, lenLabel.TextSize, lenLabel.TextColor3, lenLabel.Text, lenLabel.LayoutOrder = UDim2.new(0, 20, 0, 34), 1, Enum.Font.GothamBold, 14, COLORS.text, tostring(CFG.MIN_SUGGEST_CHARS), 4
+local lenPlusBtn, lenPlusScale = makeIconButton("", "+", COLORS.set_bg, COLORS.set_txt, 5); lenPlusBtn.Visible = true
 
 local resetBtn, resetScale   = makeIconButton("rbxassetid://10747373176", "↺", COLORS.rst_bg, COLORS.rst_txt, 6)
 local removeBtn, removeScale = makeIconButton("rbxassetid://10747384394", "✕", COLORS.del_bg, COLORS.del_txt, 7)
+local speedBtn, speedScale, speedTxt = makeIconButton("", "⚡", COLORS.set_bg, COLORS.set_txt, 8); speedBtn.Visible = true
+local autoBtn, autoScale, autoTxt = makeIconButton("", "A", COLORS.set_bg, COLORS.set_txt, 9); autoBtn.Visible = true
 
 -- ════════════════════════════════════════════
---  DISPLAY / PULSE / ANIMATION
+--  SPEED POPUP PANEL (หน้าต่างปรับความเร็ว)
 -- ════════════════════════════════════════════
+local speedPopup = Instance.new("Frame", gui)
+speedPopup.Size, speedPopup.Position, speedPopup.BackgroundColor3 = UDim2.new(0, 160, 0, 95), UDim2.new(0.5, -80, 0, 78), COLORS.popup_bg
+speedPopup.Visible, speedPopup.BackgroundTransparency = false, 0.1
+Instance.new("UICorner", speedPopup).CornerRadius = UDim.new(0, 14)
+local popupStroke = Instance.new("UIStroke", speedPopup); popupStroke.Color, popupStroke.Thickness = COLORS.border, 1
+
+local popupLayout = Instance.new("UIListLayout", speedPopup)
+popupLayout.HorizontalAlignment, popupLayout.VerticalAlignment, popupLayout.SortOrder, popupLayout.Padding = Enum.HorizontalAlignment.Center, Enum.VerticalAlignment.Center, Enum.SortOrder.LayoutOrder, UDim.new(0, 6)
+local popupPad = Instance.new("UIPadding", speedPopup); popupPad.PaddingTop, popupPad.PaddingBottom = UDim.new(0, 8), UDim.new(0, 8)
+
+local popupTitle = Instance.new("TextLabel", speedPopup)
+popupTitle.Size, popupTitle.BackgroundTransparency, popupTitle.Font, popupTitle.TextSize, popupTitle.TextColor3, popupTitle.Text = UDim2.new(1, 0, 0, 18), 1, Enum.Font.GothamBold, 12, COLORS.dim, "ความเร็วพิมพ์ (Speed)"
+
+local speedValLabel = Instance.new("TextLabel", speedPopup)
+speedValLabel.Size, speedValLabel.BackgroundTransparency, speedValLabel.Font, speedValLabel.TextSize, speedValLabel.TextColor3 = UDim2.new(1, 0, 0, 22), 1, Enum.Font.GothamBold, 15, COLORS.accent
+
+local function updateSpeedLabel()
+    speedValLabel.Text = string.format("%.2fs / ตัวอักษร", CURRENT_SPEED_DELAY)
+end
+updateSpeedLabel()
+
+-- แถบเลื่อนปรับความเร็ว (Slider UI)
+local sliderBg = Instance.new("Frame", speedPopup)
+sliderBg.Size, sliderBg.BackgroundColor3 = UDim2.new(0, 130, 0, 8), Color3.fromHex("222222")
+Instance.new("UICorner", sliderBg).CornerRadius = UDim.new(1, 0)
+
+local sliderFill = Instance.new("Frame", sliderBg)
+sliderFill.Size, sliderFill.BackgroundColor3 = UDim2.new(0.5, 0, 1, 0), COLORS.accent
+Instance.new("UICorner", sliderFill).CornerRadius = UDim.new(1, 0)
+
+local sliderBtn = Instance.new("TextButton", sliderBg)
+sliderBtn.Size, sliderBtn.AnchorPoint, sliderBtn.Position, sliderBtn.BackgroundColor3, sliderBtn.Text = UDim2.new(0, 14, 0, 14), Vector2.new(0.5, 0.5), UDim2.new(0.5, 0, 0.5, 0), Color3.new(1, 1, 1), ""
+Instance.new("UICorner", sliderBtn).CornerRadius = UDim.new(1, 0)
+
+local function updateSliderPos(val)
+    local alpha = math.clamp((val - CFG.TYPING_SPEED_MIN) / (CFG.TYPING_SPEED_MAX - CFG.TYPING_SPEED_MIN), 0, 1)
+    sliderFill.Size = UDim2.new(alpha, 0, 1, 0)
+    sliderBtn.Position = UDim2.new(alpha, 0, 0.5, 0)
+end
+
+local isDraggingSlider = false
+sliderBtn.MouseButton1Down:Connect(function() isDraggingSlider = true end)
+UIS.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then isDraggingSlider = false end end)
+
+UIS.InputChanged:Connect(function(input)
+    if isDraggingSlider and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local mousePos = input.Position.X
+        local absPos = sliderBg.AbsolutePosition.X
+        local absSize = sliderBg.AbsoluteSize.X
+        local alpha = math.clamp((mousePos - absPos) / absSize, 0, 1)
+        
+        -- คำนวณค่า Delay ใหม่ (สลับด้าน: ซ้ายเร็ว ขวาช้า หรือ ซ้ายช้า ขวาเร็ว ตามชอบ เลือกให้ซ้ายเร็วขวาช้า)
+        CURRENT_SPEED_DELAY = CFG.TYPING_SPEED_MIN + (alpha * (CFG.TYPING_SPEED_MAX - CFG.TYPING_SPEED_MIN))
+        updateSliderPos(CURRENT_SPEED_DELAY)
+        updateSpeedLabel()
+    end
+end)
+
+-- ฟังก์ชันเปิด/ปิด Popup ความเร็ว
+speedBtn.MouseButton1Click:Connect(function()
+    speedPopup.Visible = not speedPopup.Visible
+    updateSliderPos(CURRENT_SPEED_DELAY)
+end)
+
 local function pulse(scaleObj)
     scaleObj.Scale = 0.8
-    TweenService:Create(
-        scaleObj,
-        TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-        { Scale = 1 }
-    ):Play()
+    TweenService:Create(scaleObj, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
 end
 
 local function toggleButtons(visible)
     if visible and not resetBtn.Visible then
-        resetBtn.Visible = true
-        removeBtn.Visible = true
-        resetScale.Scale = 0
-        removeScale.Scale = 0
+        resetBtn.Visible, removeBtn.Visible = true, true
+        resetScale.Scale, removeScale.Scale = 0, 0
         TweenService:Create(resetScale, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1}):Play()
         task.wait(0.05)
         TweenService:Create(removeScale, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1}):Play()
     elseif not visible and resetBtn.Visible then
-        resetBtn.Visible = false
-        removeBtn.Visible = false
+        resetBtn.Visible, removeBtn.Visible = false, false
     end
+end
+
+-- ════════════════════════════════════════════
+--  AUTO FILL & HUMAN TYPING SYSTEM
+-- ════════════════════════════════════════════
+local currentTypeCycle = 0
+
+local function doAutoFill()
+    if isTyping then return end
+    local word = currentSuggestions[currentIndex]
+    if not word then return end
+
+    pcall(function()
+        local matchUI = LP.PlayerGui:FindFirstChild("GameUI")
+        if matchUI and matchUI:FindFirstChild("Root") and matchUI.Root:FindFirstChild("Match") then
+            local inputBar = matchUI.Root.Match:FindFirstChild("InputBar")
+            if inputBar then 
+                local pLbl = inputBar:FindFirstChild("PrefixLabel")
+                local wBox = inputBar:FindFirstChild("WordBox")
+
+                if wBox and wBox:IsA("TextBox") then
+                    local pText = (pLbl and pLbl:IsA("TextLabel")) and pLbl.Text or ""
+                    pText = pText:gsub("<[^>]*>", ""):gsub("%s+", "")
+
+                    local suffixToType = word
+                    if pText ~= "" and string.sub(word, 1, string.len(pText)) == pText then
+                        suffixToType = string.sub(word, string.len(pText) + 1)
+                    elseif lastWord ~= "" and lastWord ~= "__none__" and string.sub(word, 1, string.len(lastWord)) == lastWord then
+                        suffixToType = string.sub(word, string.len(lastWord) + 1)
+                    end
+
+                    isTyping = true
+                    currentTypeCycle = currentTypeCycle + 1
+                    local myCycle = currentTypeCycle
+
+                    wBox:CaptureFocus()
+                    wBox.Text = "" 
+                    pulse(badgeScale)
+
+                    for p, c in utf8.codes(suffixToType) do
+                        if myCycle ~= currentTypeCycle then break end 
+                        wBox.Text = wBox.Text .. utf8.char(c)
+                        wBox.CursorPosition = #wBox.Text + 1
+                        
+                        -- ใช้ค่าความเร็วจากที่ผู้ใช้ปรับใน Slider
+                        task.wait(CURRENT_SPEED_DELAY + math.random(-10, 10)/1000) 
+                    end
+
+                    if myCycle == currentTypeCycle then
+                        task.wait(0.1) 
+                        VIM:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+                        task.wait(0.05)
+                        VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+                        isTyping = false
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function checkAutoTrigger(targetWord)
+    if not isAutoFillON or isTyping then return end
+    
+    task.spawn(function()
+        task.wait(math.random(4, 10) / 10) 
+        if not isAutoFillON or isTyping then return end
+        if lastWord ~= targetWord then return end 
+        doAutoFill()
+    end)
 end
 
 local function showCurrent()
@@ -452,24 +411,24 @@ local function showCurrent()
 
     if hasWord then
         subtitleLabel.Text = "ต่อจาก " .. lastWord .. "  ·  ใช้แล้ว " .. usedCount
-
         if word then
             wordLabel.Text     = word
-            lastCharChip.Text  = "→" .. (lastChar(word) or "?")
+            autoHintChip.Text  = isAutoFillON and "[Auto Mode]" or "[Tab] พิมพ์คำนี้"
         else
             wordLabel.Text     = "ไม่มีคำแนะนำ"
-            lastCharChip.Text  = ""
+            autoHintChip.Text  = ""
+            isTyping = false 
+            currentTypeCycle = currentTypeCycle + 1 
         end
-
         toggleButtons(true)
     else
         subtitleLabel.Text = "สถานะ"
         wordLabel.Text     = "รอคำจากเกม..."
-        lastCharChip.Text  = ""
-
+        autoHintChip.Text  = ""
+        isTyping = false
+        currentTypeCycle = currentTypeCycle + 1
         toggleButtons(false)
     end
-
     pulse(badgeScale)
 end
 
@@ -480,8 +439,21 @@ local function refreshSuggestions(prefix)
 end
 
 -- ════════════════════════════════════════════
---  CORE FUNCTIONS (REMOVE & RESET)
+--  UI CONTROLS
 -- ════════════════════════════════════════════
+autoBtn.MouseButton1Click:Connect(function()
+    isAutoFillON = not isAutoFillON
+    if isAutoFillON then
+        TweenService:Create(autoBtn, TweenInfo.new(0.2), {BackgroundColor3 = COLORS.auto_on}):Play()
+        autoTxt.TextColor3 = Color3.new(1, 1, 1)
+    else
+        TweenService:Create(autoBtn, TweenInfo.new(0.2), {BackgroundColor3 = COLORS.set_bg}):Play()
+        autoTxt.TextColor3 = COLORS.set_txt
+    end
+    showCurrent() 
+    pulse(autoScale)
+end)
+
 local function doRemove()
     local word = currentSuggestions[currentIndex]
     if word then
@@ -493,39 +465,25 @@ end
 
 local function doReset()
     blacklisted = {}
-    if lastWord ~= "" and lastWord ~= "__none__" then
-        refreshSuggestions(lastWord)
-    else
-        currentSuggestions = {}
-        currentIndex        = 1
-        showCurrent()
-    end
+    if lastWord ~= "" and lastWord ~= "__none__" then refreshSuggestions(lastWord)
+    else currentSuggestions, currentIndex = {}, 1; showCurrent() end
     pulse(resetScale)
-end
-
-local function setMinSuggestChars(delta)
-    CFG.MIN_SUGGEST_CHARS = math.clamp(CFG.MIN_SUGGEST_CHARS + delta, 1, 15)
-    lenLabel.Text = tostring(CFG.MIN_SUGGEST_CHARS)
-    if lastWord ~= "" and lastWord ~= "__none__" then
-        refreshSuggestions(lastWord)
-    end
 end
 
 removeBtn.MouseButton1Click:Connect(doRemove)
 resetBtn.MouseButton1Click:Connect(doReset)
-lenMinusBtn.MouseButton1Click:Connect(function() setMinSuggestChars(-1) pulse(lenMinusScale) end)
-lenPlusBtn.MouseButton1Click:Connect(function() setMinSuggestChars(1) pulse(lenPlusScale) end)
+lenMinusBtn.MouseButton1Click:Connect(function() CFG.MIN_SUGGEST_CHARS = math.clamp(CFG.MIN_SUGGEST_CHARS - 1, 1, 15) lenLabel.Text = tostring(CFG.MIN_SUGGEST_CHARS) refreshSuggestions(lastWord) pulse(lenMinusScale) end)
+lenPlusBtn.MouseButton1Click:Connect(function() CFG.MIN_SUGGEST_CHARS = math.clamp(CFG.MIN_SUGGEST_CHARS + 1, 1, 15) lenLabel.Text = tostring(CFG.MIN_SUGGEST_CHARS) refreshSuggestions(lastWord) pulse(lenPlusScale) end)
 
-UIS.InputBegan:Connect(function(input, gameProcessedEvent)
-    if input.KeyCode == CFG.KEY_REMOVE then
-        doRemove()
-    elseif input.KeyCode == CFG.KEY_RESET then
-        doReset()
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if input.KeyCode == CFG.KEY_REMOVE then doRemove()
+    elseif input.KeyCode == CFG.KEY_RESET then doReset()
+    elseif input.KeyCode == CFG.KEY_AUTOFILL and not isTyping then doAutoFill()
     end
 end)
 
 -- ════════════════════════════════════════════
---  SCANNER
+--  SCANNER (PromptBox Path)
 -- ════════════════════════════════════════════
 local function isValidWord(str)
     if str:match("[%a%d]") then return true end
@@ -540,33 +498,21 @@ local function isValidWord(str)
 end
 
 local function pathAllowed(path)
-    for _, kw in ipairs(PATH_BLACKLIST) do
-        if path:find(kw, 1, true) then return false end
-    end
-    for _, kw in ipairs(PATH_WHITELIST) do
-        if path:find(kw, 1, true) then return true end
-    end
+    for _, kw in ipairs(PATH_BLACKLIST) do if path:find(kw, 1, true) then return false end end
+    for _, kw in ipairs(PATH_WHITELIST) do if path:find(kw, 1, true) then return true end end
     return false
 end
 
--- ════════════════════════════════════════════
---  USED-WORD TRACKER (history log → set)
--- ════════════════════════════════════════════
 local lastHistorySeen = os.clock()
-
 local function extractThaiRuns(text)
     local runs, buf = {}, {}
     local i, n = 1, #text
     while i <= n do
         local b1, b2, b3 = text:byte(i, i + 2)
         if b1 == 0xE0 and (b2 == 0xB8 or b2 == 0xB9) and b3 and b3 >= 0x80 and b3 <= 0xBF then
-            buf[#buf + 1] = text:sub(i, i + 2)
-            i = i + 3
+            buf[#buf + 1] = text:sub(i, i + 2); i = i + 3
         else
-            if #buf > 0 then
-                runs[#runs + 1] = table.concat(buf)
-                buf = {}
-            end
+            if #buf > 0 then runs[#runs + 1] = table.concat(buf); buf = {} end
             i = i + 1
         end
     end
@@ -577,16 +523,13 @@ end
 local function extractWords(text)
     local words = {}
     text = text:gsub("<[^>]*>", "")
-    for rawLine in text:gmatch("[^\n\r]+") do
-        local line = rawLine
+    for line in text:gmatch("[^\n\r]+") do
         if CFG.LOG_STRIP_PREFIX then
             local after = line:match(".*:%s*(.*)$")
             if after then line = after end
         end
         for _, run in ipairs(extractThaiRuns(line)) do
-            if utf8Len(run) >= 2 then
-                words[#words + 1] = run
-            end
+            if utf8Len(run) >= 2 then words[#words + 1] = run end
         end
     end
     return words
@@ -603,36 +546,19 @@ local function isShown(obj)
 end
 
 local function classifyHistory(path)
-    if #HISTORY_SOURCES > 0 then
-        for _, src in ipairs(HISTORY_SOURCES) do
-            if path:find(src.match, 1, true) then return src.owner end
-        end
-        return nil
-    end
-    for _, kw in ipairs(PATH_BLACKLIST) do
-        if path:find(kw, 1, true) then return nil end
-    end
-    for _, kw in ipairs(HISTORY_KEYWORDS) do
-        if path:find(kw, 1, true) then return "unknown" end
-    end
+    for _, kw in ipairs(PATH_BLACKLIST) do if path:find(kw, 1, true) then return nil end end
+    for _, kw in ipairs(HISTORY_KEYWORDS) do if path:find(kw, 1, true) then return "unknown" end end
     return nil
-end
-
-local function clearUsed()
-    usedWords = {}
-    usedCount = 0
 end
 
 local function updateUsedWords(hits)
     if #hits == 0 then
-        if CFG.CLEAR_AFTER_EMPTY > 0 and usedCount > 0
-            and os.clock() - lastHistorySeen >= CFG.CLEAR_AFTER_EMPTY then
-            clearUsed()
+        if CFG.CLEAR_AFTER_EMPTY > 0 and usedCount > 0 and os.clock() - lastHistorySeen >= CFG.CLEAR_AFTER_EMPTY then
+            usedWords, usedCount = {}, 0
             return true
         end
         return false
     end
-
     lastHistorySeen = os.clock()
     local changed = false
     for _, h in ipairs(hits) do
@@ -647,29 +573,32 @@ local function updateUsedWords(hits)
     return changed
 end
 
--- ════════════════════════════════════════════
---  SCAN (คำปัจจุบัน + history log ในรอบเดียว)
--- ════════════════════════════════════════════
 local function scanAll()
     local candidates, history = {}, {}
+    local myTurn = false 
+
+    pcall(function()
+        local matchUI = LP.PlayerGui:FindFirstChild("GameUI")
+        if matchUI and matchUI:FindFirstChild("Root") and matchUI.Root:FindFirstChild("Match") then
+            local promptLbl = matchUI.Root.Match:FindFirstChild("PromptBox") and matchUI.Root.Match.PromptBox:FindFirstChild("Prompt")
+            if promptLbl and promptLbl:IsA("TextLabel") then
+                if promptLbl.Text:find("ตาคุณ") and isShown(promptLbl) then
+                    myTurn = true
+                end
+            end
+        end
+    end)
+    
     local function recurse(root)
         for _, obj in ipairs(root:GetDescendants()) do
-            if obj:IsA("TextLabel") or obj:IsA("TextBox") then
+            if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and not obj:IsDescendantOf(gui) then
                 local txt = obj.Text or ""
-                if txt ~= "" and not obj:IsDescendantOf(gui) then
+                if txt ~= "" then
                     local path = obj:GetFullName()
-
-                    -- (1) คำปัจจุบันที่ต้องต่อ
                     local ts = obj.TextSize or 0
-                    if #txt >= CFG.MIN_LEN and #txt <= CFG.MAX_LEN
-                        and ts >= CFG.MIN_TXTSIZE
-                        and isValidWord(txt)
-                        and pathAllowed(path)
-                    then
+                    if #txt >= CFG.MIN_LEN and #txt <= CFG.MAX_LEN and ts >= CFG.MIN_TXTSIZE and isValidWord(txt) and pathAllowed(path) then
                         table.insert(candidates, { text = txt, size = ts, path = path })
                     end
-
-                    -- (2) history log ทั่วไป
                     if CFG.TRACK_USED then
                         local owner = classifyHistory(path)
                         if owner and (not CFG.HISTORY_VISIBLE_ONLY or isShown(obj)) then
@@ -683,133 +612,63 @@ local function scanAll()
     recurse(game:GetService("Workspace"))
     recurse(LP.PlayerGui)
 
-    -- ═══ [เพิ่มใหม่] ตรวจจับ UI ของเกมนี้และดึงเข้าสู่ Blacklist ═══
     if CFG.TRACK_USED then
         pcall(function()
             local matchUI = LP.PlayerGui:FindFirstChild("GameUI")
             if matchUI and matchUI:FindFirstChild("Root") and matchUI.Root:FindFirstChild("Match") then
                 local matchNode = matchUI.Root.Match
-
-                -- 1. นำคำที่คู่ต่อสู้ตอบไปเข้า Blacklist (จาก Feedback: เช่น "Syshsjjqj ตอบ: จาน")
-                local feedback = matchNode:FindFirstChild("Feedback")
-                if feedback and feedback:IsA("TextLabel") and feedback.Text ~= "" then
-                    table.insert(history, { text = feedback.Text, owner = "other", path = feedback:GetFullName() })
-                end
-
-                -- 2. นำคำใบ้ + คำที่ผมเขียนต่อ รวมกันไปเข้า Blacklist (จาก PrefixLabel + WordBox)
                 local inputBar = matchNode:FindFirstChild("InputBar")
                 if inputBar then
                     local pLbl = inputBar:FindFirstChild("PrefixLabel")
                     local wBox = inputBar:FindFirstChild("WordBox")
-
                     local pText = (pLbl and pLbl:IsA("TextLabel")) and pLbl.Text or ""
                     local wText = (wBox and wBox:IsA("TextBox")) and wBox.Text or ""
-
-                    -- ลบเว้นวรรคเผื่อมี
                     pText = pText:gsub("<[^>]*>", ""):gsub("%s+", "")
                     wText = wText:gsub("<[^>]*>", ""):gsub("%s+", "")
-
-                    local combinedWord = pText .. wText
-                    -- ถ้าพิมพ์และรวมกันแล้วยาวพอให้จับลง history เพื่อส่งต่อไปเป็น usedWords ได้เลย
-                    if #combinedWord >= 3 then 
-                        table.insert(history, { text = combinedWord, owner = "me", path = "Custom_Prefix_WordBox" })
-                    end
+                    if #(pText .. wText) >= 3 then table.insert(history, { text = (pText .. wText), owner = "me", path = "Custom_Prefix" }) end
+                end
+                local feedback = matchNode:FindFirstChild("Feedback")
+                if feedback and feedback:IsA("TextLabel") and feedback.Text ~= "" then 
+                    table.insert(history, { text = feedback.Text, owner = "other", path = feedback:GetFullName() }) 
                 end
             end
         end)
     end
-    -- ══════════════════════════════════════════════════════
-
     table.sort(candidates, function(a, b) return a.size > b.size end)
-    return candidates, history
+    
+    return candidates, history, myTurn
 end
 
--- ════════════════════════════════════════════
---  DUMP 
--- ════════════════════════════════════════════
-local function clip(s, n)
-    local len = utf8.len(s)
-    if len and len > n then
-        return s:sub(1, utf8.offset(s, n + 1) - 1) .. "…"
-    end
-    return s
-end
-
-local function dumpReport()
-    local lines = {}
-    local MAX_LINES = 150
-
-    local counts = {}
-    for _, owner in pairs(usedWords) do
-        counts[owner] = (counts[owner] or 0) + 1
-    end
-    local parts = {}
-    for owner, n in pairs(counts) do parts[#parts + 1] = owner .. "=" .. n end
-    lines[#lines + 1] = ("[WC Helper] used=%d (%s) | sources=%s"):format(
-        usedCount,
-        #parts > 0 and table.concat(parts, ", ") or "-",
-        #HISTORY_SOURCES > 0 and "config" or "keyword-guess"
-    )
-
-    local function addRoot(root)
-        for _, obj in ipairs(root:GetDescendants()) do
-            if #lines >= MAX_LINES then return end
-            if (obj:IsA("TextLabel") or obj:IsA("TextBox"))
-                and not obj:IsDescendantOf(gui)
-                and #extractThaiRuns(obj.Text or "") > 0
-                and isShown(obj)
-            then
-                local t = clip((obj.Text:gsub("[\n\r]+", " ⏎ ")), 40)
-                lines[#lines + 1] = ("%s | size=%d | %s | \"%s\""):format(
-                    obj.ClassName, obj.TextSize or 0, obj:GetFullName(), t
-                )
-            end
-        end
-    end
-    addRoot(game:GetService("Workspace"))
-    addRoot(LP.PlayerGui)
-    if #lines >= MAX_LINES then lines[#lines + 1] = "... (ตัดที่ " .. MAX_LINES .. " บรรทัด)" end
-
-    for _, l in ipairs(lines) do print(l) end
-    if setclipboard then pcall(setclipboard, table.concat(lines, "\n")) end
-end
-
-UIS.InputBegan:Connect(function(input)
-    if input.KeyCode == CFG.KEY_DUMP then
-        dumpReport()
-    end
-end)
-
--- ════════════════════════════════════════════
---  STARTUP ANIMATION & MAIN LOOP
--- ════════════════════════════════════════════
-TweenService:Create(
-    island,
-    TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-    { Position = UDim2.new(0.5, 0, 0, 16) }
-):Play()
+TweenService:Create(island, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, 0, 0, 16) }):Play()
 
 task.spawn(function()
+    local wasMyTurn = false
+
     while true do
         task.wait(CFG.SCAN_RATE)
-        local results, history = scanAll()
-        local top         = results[1]
+        local results, history, isMyTurn = scanAll()
+        local top = results[1]
         local usedChanged = updateUsedWords(history)
+        local wordChanged = false
 
         if top and top.text ~= lastWord then
             lastWord = top.text
             refreshSuggestions(top.text)
-
+            wordChanged = true
         elseif not top and lastWord ~= "__none__" then
-            lastWord            = "__none__"
-            currentSuggestions  = {}
-            currentIndex        = 1
+            lastWord, currentSuggestions, currentIndex = "__none__", {}, 1
             showCurrent()
-
+            wordChanged = true
         elseif usedChanged and lastWord ~= "" and lastWord ~= "__none__" then
             refreshSuggestions(lastWord)
         end
+
+        if isAutoFillON and isMyTurn and currentSuggestions[1] then
+            if (not wasMyTurn) or wordChanged then
+                checkAutoTrigger(lastWord)
+            end
+        end
+
+        wasMyTurn = isMyTurn
     end
 end)
-
-print("[WC Helper] v3.1 | Game-specific UI Tracked | online")
