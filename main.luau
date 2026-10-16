@@ -1,4 +1,4 @@
--- WordChain Helper | v3.0 (Updated: used-word tracker from table history log) | Large Dynamic Island UI
+-- WordChain Helper | v3.1 (Custom UI Tracker Added) | Large Dynamic Island UI
 
 local Players       = game:GetService("Players")
 local TweenService  = game:GetService("TweenService")
@@ -32,15 +32,7 @@ local PATH_WHITELIST = { "InputBar", "Match", "GameWord", "CurrentWord", "WordDi
 local PATH_BLACKLIST = { "Menu", "Settings", "Lobby", "Profile", "Button", "Mode", "Code" }
 
 -- ═══ HISTORY LOG (ประวัติคำบนโต๊ะ) ═══
--- บอกสคริปต์ว่า TextLabel ตัวไหนคือ history log และเป็นของใคร
---   match = ข้อความที่ต้องอยู่ใน GetFullName() ของ label (เทียบตรง ๆ ไม่ใช่ pattern)
---   owner = "me" หรือ "other" (ใช้แยกสถิติ/ดีบัก — คำจากทั้งสองฝั่งถูกกรองออกเหมือนกัน)
--- กดปุ่ม KEY_DUMP (Insert) ในเกมเพื่อดู path จริง แล้วคัดลอกมาใส่ตรงนี้
-local HISTORY_SOURCES = {
-    -- { owner = "me",    match = "PlayerGui.Game.Table.MyHistory" },
-    -- { owner = "other", match = "PlayerGui.Game.Table.OpponentHistory" },
-}
--- ถ้า HISTORY_SOURCES ว่าง จะเดาจาก keyword เหล่านี้แทน (owner = "unknown")
+local HISTORY_SOURCES = {}
 local HISTORY_KEYWORDS = { "History", "UsedWords", "WordLog", "WordList" }
 
 -- ════════════════════════════════════════════
@@ -49,7 +41,7 @@ local HISTORY_KEYWORDS = { "History", "UsedWords", "WordLog", "WordList" }
 local SOURCE_URL = "https://raw.githubusercontent.com/PyThaiNLP/pythainlp/dev/pythainlp/corpus/words_th.txt"
 local CACHE_PATH = "WordDB_ptnlp.txt"
 
--- คลังความถี่คำ (Thai National Corpus) ใช้จัดลำดับว่าคำไหน "คนรู้จัก" มากกว่ากัน
+-- คลังความถี่คำ (Thai National Corpus)
 local FREQ_SOURCE_URL = "https://raw.githubusercontent.com/PyThaiNLP/pythainlp/dev/pythainlp/corpus/tnc_freq.txt"
 local FREQ_CACHE_PATH = "WordFreq_tnc.txt"
 
@@ -62,8 +54,6 @@ local function firstChar(str)
     else                   return str:sub(1, 1) end
 end
 
--- เช็คว่าทั้งคำประกอบด้วยอักขระไทยล้วน ๆ (บล็อก U+0E00–U+0E7F เท่านั้น)
--- ตัดคำที่มีจุด (.), เว้นวรรค, ตัวเลข, เครื่องหมายขีด ฯลฯ ปนอยู่ทิ้งไปเลย
 local function isThaiOnlyWord(word)
     local len = #word
     if len == 0 or len % 3 ~= 0 then return false end
@@ -91,7 +81,6 @@ local function buildDB(text)
     return db
 end
 
--- แปลงไฟล์ tnc_freq.txt (รูปแบบ "คำ<TAB>จำนวนครั้ง") เป็นตาราง word -> count
 local function buildFreqDB(text)
     local freq = {}
     for line in text:gmatch("[^\n\r]+") do
@@ -118,7 +107,6 @@ local function loadWordDB()
     end
     local ok, body = pcall(function() return game:HttpGet(SOURCE_URL) end)
     if not ok or not body or #body < 500 then
-        warn("[WC Helper] โหลด WordDB ไม่สำเร็จ")
         return {}
     end
     if writefile then pcall(writefile, CACHE_PATH, body) end
@@ -137,7 +125,6 @@ local function loadFreqDB()
     end
     local ok, body = pcall(function() return game:HttpGet(FREQ_SOURCE_URL) end)
     if not ok or not body or #body < 500 then
-        warn("[WC Helper] โหลด WordFreq ไม่สำเร็จ (จะเรียงคำตามความยาวแทนความถี่)")
         return {}
     end
     if writefile then pcall(writefile, FREQ_CACHE_PATH, body) end
@@ -151,8 +138,6 @@ WORD_FREQ = loadFreqDB()
 --  BLACKLIST
 -- ════════════════════════════════════════════
 local blacklisted = {}
-
--- คำที่ถูกใช้ไปแล้วในเกม (set: คำ -> owner) — เติมโดย tracker, กรองออกใน getSuggestions
 local usedWords = {}
 local usedCount = 0
 
@@ -172,7 +157,6 @@ local function lastChar(str)
     return nil
 end
 
--- นับจำนวน "ตัวอักษร" (code point) จริง ๆ ไม่ใช่จำนวนไบต์
 local function utf8Len(str)
     local n = 0
     for i = 1, #str do
@@ -203,8 +187,6 @@ local function getSuggestions(prefix)
         end
     end
 
-    -- เรียงคำที่ "คนรู้จักเยอะกว่า" (ความถี่ใน TNC สูงกว่า) ไว้ก่อน
-    -- ถ้าความถี่เท่ากัน (หรือไม่มีข้อมูลความถี่เลย) ให้คำที่สั้นกว่ามาก่อนเหมือนเดิม
     table.sort(out, function(a, b)
         local fa = WORD_FREQ[a] or 0
         local fb = WORD_FREQ[b] or 0
@@ -246,7 +228,6 @@ local COLORS = {
     set_txt   = Color3.fromHex("AEB4BA"),
 }
 
--- ลบ UI เก่าทิ้งถ้ามี
 if PGui:FindFirstChild("WC_Helper") then
     PGui:FindFirstChild("WC_Helper"):Destroy()
 end
@@ -258,7 +239,6 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.IgnoreGuiInset = true
 gui.Parent         = PGui
 
--- Dynamic Island container
 local island = Instance.new("Frame")
 island.Name             = "DynamicIsland"
 island.AnchorPoint      = Vector2.new(0.5, 0)
@@ -286,7 +266,6 @@ islandLayout.VerticalAlignment  = Enum.VerticalAlignment.Center
 islandLayout.Padding            = UDim.new(0, 12)
 islandLayout.SortOrder          = Enum.SortOrder.LayoutOrder
 
--- badge (left)
 local badge = Instance.new("Frame")
 badge.Size             = UDim2.new(0, 36, 0, 36)
 badge.BackgroundColor3 = COLORS.accent
@@ -306,7 +285,6 @@ badgeLabel.TextColor3        = COLORS.bg
 badgeLabel.Text              = "W"
 badgeLabel.Parent            = badge
 
--- text stack (middle)
 local textStack = Instance.new("Frame")
 textStack.BackgroundTransparency = 1
 textStack.Size           = UDim2.new(0, 0, 0, 42)
@@ -367,7 +345,6 @@ lastCharChip.Text              = ""
 lastCharChip.LayoutOrder       = 2
 lastCharChip.Parent            = wordRow
 
--- icon button factory with Animations
 local function makeIconButton(iconAssetId, fallbackText, bgColor, iconColor, order)
     local btn = Instance.new("ImageButton")
     btn.Size             = UDim2.new(0, 34, 0, 34)
@@ -422,7 +399,6 @@ local function makeIconButton(iconAssetId, fallbackText, bgColor, iconColor, ord
     return btn, btnScale
 end
 
--- ตัวปรับความยาวคำขั้นต่ำ (แสดงตลอดเวลา ไม่ผูกกับสถานะมีคำ/ไม่มีคำ)
 local lenMinusBtn, lenMinusScale = makeIconButton("", "-", COLORS.set_bg, COLORS.set_txt, 3)
 lenMinusBtn.Visible = true
 
@@ -535,23 +511,12 @@ local function setMinSuggestChars(delta)
     end
 end
 
--- ════════════════════════════════════════════
---  INPUT HANDLERS (BUTTONS & HOTKEYS)
--- ════════════════════════════════════════════
 removeBtn.MouseButton1Click:Connect(doRemove)
 resetBtn.MouseButton1Click:Connect(doReset)
-lenMinusBtn.MouseButton1Click:Connect(function()
-    setMinSuggestChars(-1)
-    pulse(lenMinusScale)
-end)
-lenPlusBtn.MouseButton1Click:Connect(function()
-    setMinSuggestChars(1)
-    pulse(lenPlusScale)
-end)
+lenMinusBtn.MouseButton1Click:Connect(function() setMinSuggestChars(-1) pulse(lenMinusScale) end)
+lenPlusBtn.MouseButton1Click:Connect(function() setMinSuggestChars(1) pulse(lenPlusScale) end)
 
 UIS.InputBegan:Connect(function(input, gameProcessedEvent)
-    -- ลบเงื่อนไข if gameProcessedEvent then return end ออก
-    -- ทำให้ถึงแม้กำลังพิมพ์ข้อความอยู่ก็สามารถกดปุ่ม Alt หรือ Delete เพื่อใช้งานได้เลย
     if input.KeyCode == CFG.KEY_REMOVE then
         doRemove()
     elseif input.KeyCode == CFG.KEY_RESET then
@@ -589,7 +554,6 @@ end
 -- ════════════════════════════════════════════
 local lastHistorySeen = os.clock()
 
--- ดึง "ชุดอักขระไทยที่ติดกัน" ออกจากข้อความ (ตัดชื่อ/ตัวเลข/เครื่องหมายทิ้ง)
 local function extractThaiRuns(text)
     local runs, buf = {}, {}
     local i, n = 1, #text
@@ -610,10 +574,9 @@ local function extractThaiRuns(text)
     return runs
 end
 
--- แปลงข้อความใน history label เป็นรายการคำ (รองรับทั้ง 1 label = 1 คำ และ 1 label = หลายบรรทัด)
 local function extractWords(text)
     local words = {}
-    text = text:gsub("<[^>]*>", "") -- ตัด RichText tag
+    text = text:gsub("<[^>]*>", "")
     for rawLine in text:gmatch("[^\n\r]+") do
         local line = rawLine
         if CFG.LOG_STRIP_PREFIX then
@@ -629,7 +592,6 @@ local function extractWords(text)
     return words
 end
 
--- label (และ parent ทุกชั้น) มองเห็นอยู่จริงไหม
 local function isShown(obj)
     local cur = obj
     while cur do
@@ -640,7 +602,6 @@ local function isShown(obj)
     return true
 end
 
--- path นี้เป็น history log ของใคร (nil = ไม่ใช่ history log)
 local function classifyHistory(path)
     if #HISTORY_SOURCES > 0 then
         for _, src in ipairs(HISTORY_SOURCES) do
@@ -662,7 +623,6 @@ local function clearUsed()
     usedCount = 0
 end
 
--- เติมคำจาก history ที่สแกนได้ลง set — คืน true ถ้า set เปลี่ยน
 local function updateUsedWords(hits)
     if #hits == 0 then
         if CFG.CLEAR_AFTER_EMPTY > 0 and usedCount > 0
@@ -699,7 +659,7 @@ local function scanAll()
                 if txt ~= "" and not obj:IsDescendantOf(gui) then
                     local path = obj:GetFullName()
 
-                    -- (1) คำปัจจุบันที่ต้องต่อ (ตรรกะเดิม)
+                    -- (1) คำปัจจุบันที่ต้องต่อ
                     local ts = obj.TextSize or 0
                     if #txt >= CFG.MIN_LEN and #txt <= CFG.MAX_LEN
                         and ts >= CFG.MIN_TXTSIZE
@@ -709,7 +669,7 @@ local function scanAll()
                         table.insert(candidates, { text = txt, size = ts, path = path })
                     end
 
-                    -- (2) history log บนโต๊ะ
+                    -- (2) history log ทั่วไป
                     if CFG.TRACK_USED then
                         local owner = classifyHistory(path)
                         if owner and (not CFG.HISTORY_VISIBLE_ONLY or isShown(obj)) then
@@ -722,12 +682,50 @@ local function scanAll()
     end
     recurse(game:GetService("Workspace"))
     recurse(LP.PlayerGui)
+
+    -- ═══ [เพิ่มใหม่] ตรวจจับ UI ของเกมนี้และดึงเข้าสู่ Blacklist ═══
+    if CFG.TRACK_USED then
+        pcall(function()
+            local matchUI = LP.PlayerGui:FindFirstChild("GameUI")
+            if matchUI and matchUI:FindFirstChild("Root") and matchUI.Root:FindFirstChild("Match") then
+                local matchNode = matchUI.Root.Match
+
+                -- 1. นำคำที่คู่ต่อสู้ตอบไปเข้า Blacklist (จาก Feedback: เช่น "Syshsjjqj ตอบ: จาน")
+                local feedback = matchNode:FindFirstChild("Feedback")
+                if feedback and feedback:IsA("TextLabel") and feedback.Text ~= "" then
+                    table.insert(history, { text = feedback.Text, owner = "other", path = feedback:GetFullName() })
+                end
+
+                -- 2. นำคำใบ้ + คำที่ผมเขียนต่อ รวมกันไปเข้า Blacklist (จาก PrefixLabel + WordBox)
+                local inputBar = matchNode:FindFirstChild("InputBar")
+                if inputBar then
+                    local pLbl = inputBar:FindFirstChild("PrefixLabel")
+                    local wBox = inputBar:FindFirstChild("WordBox")
+
+                    local pText = (pLbl and pLbl:IsA("TextLabel")) and pLbl.Text or ""
+                    local wText = (wBox and wBox:IsA("TextBox")) and wBox.Text or ""
+
+                    -- ลบเว้นวรรคเผื่อมี
+                    pText = pText:gsub("<[^>]*>", ""):gsub("%s+", "")
+                    wText = wText:gsub("<[^>]*>", ""):gsub("%s+", "")
+
+                    local combinedWord = pText .. wText
+                    -- ถ้าพิมพ์และรวมกันแล้วยาวพอให้จับลง history เพื่อส่งต่อไปเป็น usedWords ได้เลย
+                    if #combinedWord >= 3 then 
+                        table.insert(history, { text = combinedWord, owner = "me", path = "Custom_Prefix_WordBox" })
+                    end
+                end
+            end
+        end)
+    end
+    -- ══════════════════════════════════════════════════════
+
     table.sort(candidates, function(a, b) return a.size > b.size end)
     return candidates, history
 end
 
 -- ════════════════════════════════════════════
---  DUMP (ช่วยหา path ของ history log)
+--  DUMP 
 -- ════════════════════════════════════════════
 local function clip(s, n)
     local len = utf8.len(s)
@@ -809,10 +807,9 @@ task.spawn(function()
             showCurrent()
 
         elseif usedChanged and lastWord ~= "" and lastWord ~= "__none__" then
-            -- มีคำใหม่เข้า set ระหว่างที่คำปัจจุบันยังเหมือนเดิม → คำนวณคำแนะนำใหม่
             refreshSuggestions(lastWord)
         end
     end
 end)
 
-print("[WC Helper] v3.0 | used-word tracker + Thai-only filter + common-word sort + length stepper | PyThaiNLP + TNC | online")
+print("[WC Helper] v3.1 | Game-specific UI Tracked | online")
