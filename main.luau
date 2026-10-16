@@ -1,4 +1,4 @@
--- WordChain Helper | v2.9 (Updated: Thai-only filter, common-word sorting, length stepper) | Large Dynamic Island UI
+-- WordChain Helper | v3.0 (Updated: used-word tracker from table history log) | Large Dynamic Island UI
 
 local Players       = game:GetService("Players")
 local TweenService  = game:GetService("TweenService")
@@ -19,10 +19,29 @@ local CFG = {
     -- ตั้งค่าคีย์ลัดที่นี่ (Keyboard Shortcuts)
     KEY_REMOVE  = Enum.KeyCode.LeftAlt, -- แนะนำใช้ Alt ซ้าย จะกดง่ายสุดตอนกำลังพิมพ์
     KEY_RESET   = Enum.KeyCode.Delete,
+
+    -- ═══ ระบบเก็บคำที่ถูกใช้ไปแล้ว (Used-word tracker) ═══
+    TRACK_USED           = true,  -- เปิด/ปิดระบบ
+    HISTORY_VISIBLE_ONLY = true,  -- นับเฉพาะ label ที่มองเห็นอยู่จริง (ไม่นับ UI ที่ซ่อนอยู่)
+    CLEAR_AFTER_EMPTY    = 8,     -- history log ว่างต่อเนื่องกี่วินาที = จบรอบ → ล้างคำที่ใช้แล้ว (0 = ไม่ล้างอัตโนมัติ)
+    LOG_STRIP_PREFIX     = true,  -- บรรทัดที่มี ":" ให้เอาเฉพาะข้างหลัง (ตัดชื่อผู้เล่นใน "ชื่อ: คำ")
+    KEY_DUMP             = Enum.KeyCode.Insert, -- dump path/ข้อความของ label ภาษาไทยทั้งหมด (print + copy ลง clipboard)
 }
 
 local PATH_WHITELIST = { "InputBar", "Match", "GameWord", "CurrentWord", "WordDisplay" }
 local PATH_BLACKLIST = { "Menu", "Settings", "Lobby", "Profile", "Button", "Mode", "Code" }
+
+-- ═══ HISTORY LOG (ประวัติคำบนโต๊ะ) ═══
+-- บอกสคริปต์ว่า TextLabel ตัวไหนคือ history log และเป็นของใคร
+--   match = ข้อความที่ต้องอยู่ใน GetFullName() ของ label (เทียบตรง ๆ ไม่ใช่ pattern)
+--   owner = "me" หรือ "other" (ใช้แยกสถิติ/ดีบัก — คำจากทั้งสองฝั่งถูกกรองออกเหมือนกัน)
+-- กดปุ่ม KEY_DUMP (Insert) ในเกมเพื่อดู path จริง แล้วคัดลอกมาใส่ตรงนี้
+local HISTORY_SOURCES = {
+    -- { owner = "me",    match = "PlayerGui.Game.Table.MyHistory" },
+    -- { owner = "other", match = "PlayerGui.Game.Table.OpponentHistory" },
+}
+-- ถ้า HISTORY_SOURCES ว่าง จะเดาจาก keyword เหล่านี้แทน (owner = "unknown")
+local HISTORY_KEYWORDS = { "History", "UsedWords", "WordLog", "WordList" }
 
 -- ════════════════════════════════════════════
 --  WORD DB
@@ -133,6 +152,10 @@ WORD_FREQ = loadFreqDB()
 -- ════════════════════════════════════════════
 local blacklisted = {}
 
+-- คำที่ถูกใช้ไปแล้วในเกม (set: คำ -> owner) — เติมโดย tracker, กรองออกใน getSuggestions
+local usedWords = {}
+local usedCount = 0
+
 -- ════════════════════════════════════════════
 --  UTF-8 HELPERS
 -- ════════════════════════════════════════════
@@ -175,7 +198,7 @@ local function getSuggestions(prefix)
     local minChars = CFG.MIN_SUGGEST_CHARS
 
     for _, w in ipairs(bucket) do
-        if #w > plen and w:sub(1, plen) == prefix and not blacklisted[w] and utf8Len(w) >= minChars then
+        if #w > plen and w:sub(1, plen) == prefix and not blacklisted[w] and not usedWords[w] and utf8Len(w) >= minChars then
             table.insert(out, w)
         end
     end
@@ -452,7 +475,7 @@ local function showCurrent()
     local hasWord = (lastWord ~= "" and lastWord ~= "__none__")
 
     if hasWord then
-        subtitleLabel.Text = "ต่อจาก " .. lastWord
+        subtitleLabel.Text = "ต่อจาก " .. lastWord .. "  ·  ใช้แล้ว " .. usedCount
 
         if word then
             wordLabel.Text     = word
@@ -561,22 +584,137 @@ local function pathAllowed(path)
     return false
 end
 
-local function scanGameWord()
-    local candidates = {}
+-- ════════════════════════════════════════════
+--  USED-WORD TRACKER (history log → set)
+-- ════════════════════════════════════════════
+local lastHistorySeen = os.clock()
+
+-- ดึง "ชุดอักขระไทยที่ติดกัน" ออกจากข้อความ (ตัดชื่อ/ตัวเลข/เครื่องหมายทิ้ง)
+local function extractThaiRuns(text)
+    local runs, buf = {}, {}
+    local i, n = 1, #text
+    while i <= n do
+        local b1, b2, b3 = text:byte(i, i + 2)
+        if b1 == 0xE0 and (b2 == 0xB8 or b2 == 0xB9) and b3 and b3 >= 0x80 and b3 <= 0xBF then
+            buf[#buf + 1] = text:sub(i, i + 2)
+            i = i + 3
+        else
+            if #buf > 0 then
+                runs[#runs + 1] = table.concat(buf)
+                buf = {}
+            end
+            i = i + 1
+        end
+    end
+    if #buf > 0 then runs[#runs + 1] = table.concat(buf) end
+    return runs
+end
+
+-- แปลงข้อความใน history label เป็นรายการคำ (รองรับทั้ง 1 label = 1 คำ และ 1 label = หลายบรรทัด)
+local function extractWords(text)
+    local words = {}
+    text = text:gsub("<[^>]*>", "") -- ตัด RichText tag
+    for rawLine in text:gmatch("[^\n\r]+") do
+        local line = rawLine
+        if CFG.LOG_STRIP_PREFIX then
+            local after = line:match(".*:%s*(.*)$")
+            if after then line = after end
+        end
+        for _, run in ipairs(extractThaiRuns(line)) do
+            if utf8Len(run) >= 2 then
+                words[#words + 1] = run
+            end
+        end
+    end
+    return words
+end
+
+-- label (และ parent ทุกชั้น) มองเห็นอยู่จริงไหม
+local function isShown(obj)
+    local cur = obj
+    while cur do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("LayerCollector") and not cur.Enabled then return false end
+        cur = cur.Parent
+    end
+    return true
+end
+
+-- path นี้เป็น history log ของใคร (nil = ไม่ใช่ history log)
+local function classifyHistory(path)
+    if #HISTORY_SOURCES > 0 then
+        for _, src in ipairs(HISTORY_SOURCES) do
+            if path:find(src.match, 1, true) then return src.owner end
+        end
+        return nil
+    end
+    for _, kw in ipairs(PATH_BLACKLIST) do
+        if path:find(kw, 1, true) then return nil end
+    end
+    for _, kw in ipairs(HISTORY_KEYWORDS) do
+        if path:find(kw, 1, true) then return "unknown" end
+    end
+    return nil
+end
+
+local function clearUsed()
+    usedWords = {}
+    usedCount = 0
+end
+
+-- เติมคำจาก history ที่สแกนได้ลง set — คืน true ถ้า set เปลี่ยน
+local function updateUsedWords(hits)
+    if #hits == 0 then
+        if CFG.CLEAR_AFTER_EMPTY > 0 and usedCount > 0
+            and os.clock() - lastHistorySeen >= CFG.CLEAR_AFTER_EMPTY then
+            clearUsed()
+            return true
+        end
+        return false
+    end
+
+    lastHistorySeen = os.clock()
+    local changed = false
+    for _, h in ipairs(hits) do
+        for _, w in ipairs(extractWords(h.text)) do
+            if not usedWords[w] then
+                usedWords[w] = h.owner
+                usedCount = usedCount + 1
+                changed = true
+            end
+        end
+    end
+    return changed
+end
+
+-- ════════════════════════════════════════════
+--  SCAN (คำปัจจุบัน + history log ในรอบเดียว)
+-- ════════════════════════════════════════════
+local function scanAll()
+    local candidates, history = {}, {}
     local function recurse(root)
         for _, obj in ipairs(root:GetDescendants()) do
             if obj:IsA("TextLabel") or obj:IsA("TextBox") then
-                local txt  = obj.Text or ""
-                local ts   = obj.TextSize or 0
-                local path = obj:GetFullName()
-                if #txt >= CFG.MIN_LEN and #txt <= CFG.MAX_LEN
-                    and ts >= CFG.MIN_TXTSIZE
-                    and isValidWord(txt)
-                    and pathAllowed(path)
-                then
-                    local pg = obj:FindFirstAncestorWhichIsA("ScreenGui")
-                    if not pg or pg.Name ~= "WC_Helper" then
+                local txt = obj.Text or ""
+                if txt ~= "" and not obj:IsDescendantOf(gui) then
+                    local path = obj:GetFullName()
+
+                    -- (1) คำปัจจุบันที่ต้องต่อ (ตรรกะเดิม)
+                    local ts = obj.TextSize or 0
+                    if #txt >= CFG.MIN_LEN and #txt <= CFG.MAX_LEN
+                        and ts >= CFG.MIN_TXTSIZE
+                        and isValidWord(txt)
+                        and pathAllowed(path)
+                    then
                         table.insert(candidates, { text = txt, size = ts, path = path })
+                    end
+
+                    -- (2) history log บนโต๊ะ
+                    if CFG.TRACK_USED then
+                        local owner = classifyHistory(path)
+                        if owner and (not CFG.HISTORY_VISIBLE_ONLY or isShown(obj)) then
+                            table.insert(history, { text = txt, owner = owner, path = path })
+                        end
                     end
                 end
             end
@@ -585,8 +723,64 @@ local function scanGameWord()
     recurse(game:GetService("Workspace"))
     recurse(LP.PlayerGui)
     table.sort(candidates, function(a, b) return a.size > b.size end)
-    return candidates
+    return candidates, history
 end
+
+-- ════════════════════════════════════════════
+--  DUMP (ช่วยหา path ของ history log)
+-- ════════════════════════════════════════════
+local function clip(s, n)
+    local len = utf8.len(s)
+    if len and len > n then
+        return s:sub(1, utf8.offset(s, n + 1) - 1) .. "…"
+    end
+    return s
+end
+
+local function dumpReport()
+    local lines = {}
+    local MAX_LINES = 150
+
+    local counts = {}
+    for _, owner in pairs(usedWords) do
+        counts[owner] = (counts[owner] or 0) + 1
+    end
+    local parts = {}
+    for owner, n in pairs(counts) do parts[#parts + 1] = owner .. "=" .. n end
+    lines[#lines + 1] = ("[WC Helper] used=%d (%s) | sources=%s"):format(
+        usedCount,
+        #parts > 0 and table.concat(parts, ", ") or "-",
+        #HISTORY_SOURCES > 0 and "config" or "keyword-guess"
+    )
+
+    local function addRoot(root)
+        for _, obj in ipairs(root:GetDescendants()) do
+            if #lines >= MAX_LINES then return end
+            if (obj:IsA("TextLabel") or obj:IsA("TextBox"))
+                and not obj:IsDescendantOf(gui)
+                and #extractThaiRuns(obj.Text or "") > 0
+                and isShown(obj)
+            then
+                local t = clip((obj.Text:gsub("[\n\r]+", " ⏎ ")), 40)
+                lines[#lines + 1] = ("%s | size=%d | %s | \"%s\""):format(
+                    obj.ClassName, obj.TextSize or 0, obj:GetFullName(), t
+                )
+            end
+        end
+    end
+    addRoot(game:GetService("Workspace"))
+    addRoot(LP.PlayerGui)
+    if #lines >= MAX_LINES then lines[#lines + 1] = "... (ตัดที่ " .. MAX_LINES .. " บรรทัด)" end
+
+    for _, l in ipairs(lines) do print(l) end
+    if setclipboard then pcall(setclipboard, table.concat(lines, "\n")) end
+end
+
+UIS.InputBegan:Connect(function(input)
+    if input.KeyCode == CFG.KEY_DUMP then
+        dumpReport()
+    end
+end)
 
 -- ════════════════════════════════════════════
 --  STARTUP ANIMATION & MAIN LOOP
@@ -600,8 +794,9 @@ TweenService:Create(
 task.spawn(function()
     while true do
         task.wait(CFG.SCAN_RATE)
-        local results = scanGameWord()
-        local top     = results[1]
+        local results, history = scanAll()
+        local top         = results[1]
+        local usedChanged = updateUsedWords(history)
 
         if top and top.text ~= lastWord then
             lastWord = top.text
@@ -612,8 +807,12 @@ task.spawn(function()
             currentSuggestions  = {}
             currentIndex        = 1
             showCurrent()
+
+        elseif usedChanged and lastWord ~= "" and lastWord ~= "__none__" then
+            -- มีคำใหม่เข้า set ระหว่างที่คำปัจจุบันยังเหมือนเดิม → คำนวณคำแนะนำใหม่
+            refreshSuggestions(lastWord)
         end
     end
 end)
 
-print("[WC Helper] v2.9 | Thai-only filter + common-word sort + length stepper | PyThaiNLP + TNC | online")
+print("[WC Helper] v3.0 | used-word tracker + Thai-only filter + common-word sort + length stepper | PyThaiNLP + TNC | online")
