@@ -1,4 +1,4 @@
--- WordChain Helper | v2.8 (Updated: Animations & Keybinds) | Large Dynamic Island UI
+-- WordChain Helper | v2.9 (Updated: Thai-only filter, common-word sorting, length stepper) | Large Dynamic Island UI
 
 local Players       = game:GetService("Players")
 local TweenService  = game:GetService("TweenService")
@@ -12,10 +12,13 @@ local CFG = {
     MIN_LEN     = 1,
     MAX_LEN     = 40,
     MAX_SUGGEST = 30,
-    
+
+    -- ความยาวคำแนะนำขั้นต่ำ (หน่วย: ตัวอักษรไทย) ปรับได้จาก UI ด้วยปุ่ม -/+
+    MIN_SUGGEST_CHARS = 6,
+
     -- ตั้งค่าคีย์ลัดที่นี่ (Keyboard Shortcuts)
     KEY_REMOVE  = Enum.KeyCode.LeftAlt, -- แนะนำใช้ Alt ซ้าย จะกดง่ายสุดตอนกำลังพิมพ์
-    KEY_RESET   = Enum.KeyCode.Delete,  
+    KEY_RESET   = Enum.KeyCode.Delete,
 }
 
 local PATH_WHITELIST = { "InputBar", "Match", "GameWord", "CurrentWord", "WordDisplay" }
@@ -27,6 +30,10 @@ local PATH_BLACKLIST = { "Menu", "Settings", "Lobby", "Profile", "Button", "Mode
 local SOURCE_URL = "https://raw.githubusercontent.com/PyThaiNLP/pythainlp/dev/pythainlp/corpus/words_th.txt"
 local CACHE_PATH = "WordDB_ptnlp.txt"
 
+-- คลังความถี่คำ (Thai National Corpus) ใช้จัดลำดับว่าคำไหน "คนรู้จัก" มากกว่ากัน
+local FREQ_SOURCE_URL = "https://raw.githubusercontent.com/PyThaiNLP/pythainlp/dev/pythainlp/corpus/tnc_freq.txt"
+local FREQ_CACHE_PATH = "WordFreq_tnc.txt"
+
 local function firstChar(str)
     if #str == 0 then return nil end
     local b = str:byte(1)
@@ -36,12 +43,25 @@ local function firstChar(str)
     else                   return str:sub(1, 1) end
 end
 
+-- เช็คว่าทั้งคำประกอบด้วยอักขระไทยล้วน ๆ (บล็อก U+0E00–U+0E7F เท่านั้น)
+-- ตัดคำที่มีจุด (.), เว้นวรรค, ตัวเลข, เครื่องหมายขีด ฯลฯ ปนอยู่ทิ้งไปเลย
+local function isThaiOnlyWord(word)
+    local len = #word
+    if len == 0 or len % 3 ~= 0 then return false end
+    for i = 1, len, 3 do
+        local b1, b2, b3 = word:byte(i, i + 2)
+        if b1 ~= 0xE0 or (b2 ~= 0xB8 and b2 ~= 0xB9) or not b3 or b3 < 0x80 or b3 > 0xBF then
+            return false
+        end
+    end
+    return true
+end
+
 local function buildDB(text)
     local db = {}
     for line in text:gmatch("[^\n\r]+") do
         local word = line:match("^%s*(.-)%s*$")
-        -- เพิ่ม not word:match("^[%p%c]") เพื่อเช็คว่าอักษรตัวแรกไม่ใช่เครื่องหมายวรรคตอน/อักขระพิเศษ
-        if word and #word >= 2 and not word:match("^[%p%c]") then
+        if word and #word >= 2 and isThaiOnlyWord(word) then
             local fc = firstChar(word)
             if fc then
                 if not db[fc] then db[fc] = {} end
@@ -52,7 +72,20 @@ local function buildDB(text)
     return db
 end
 
+-- แปลงไฟล์ tnc_freq.txt (รูปแบบ "คำ<TAB>จำนวนครั้ง") เป็นตาราง word -> count
+local function buildFreqDB(text)
+    local freq = {}
+    for line in text:gmatch("[^\n\r]+") do
+        local word, countStr = line:match("^(.-)\t(%d+)%s*$")
+        if word and countStr then
+            freq[word] = tonumber(countStr)
+        end
+    end
+    return freq
+end
+
 local WORD_DB
+local WORD_FREQ
 
 local function loadWordDB()
     if isfile and isfile(CACHE_PATH) then
@@ -73,7 +106,27 @@ local function loadWordDB()
     return buildDB(body)
 end
 
-WORD_DB = loadWordDB()
+local function loadFreqDB()
+    if isfile and isfile(FREQ_CACHE_PATH) then
+        local ok, cached = pcall(readfile, FREQ_CACHE_PATH)
+        if ok and cached and #cached > 500 then
+            local freq = buildFreqDB(cached)
+            local n = 0
+            for _ in pairs(freq) do n = n + 1 end
+            if n > 1000 then return freq end
+        end
+    end
+    local ok, body = pcall(function() return game:HttpGet(FREQ_SOURCE_URL) end)
+    if not ok or not body or #body < 500 then
+        warn("[WC Helper] โหลด WordFreq ไม่สำเร็จ (จะเรียงคำตามความยาวแทนความถี่)")
+        return {}
+    end
+    if writefile then pcall(writefile, FREQ_CACHE_PATH, body) end
+    return buildFreqDB(body)
+end
+
+WORD_DB   = loadWordDB()
+WORD_FREQ = loadFreqDB()
 
 -- ════════════════════════════════════════════
 --  BLACKLIST
@@ -96,6 +149,18 @@ local function lastChar(str)
     return nil
 end
 
+-- นับจำนวน "ตัวอักษร" (code point) จริง ๆ ไม่ใช่จำนวนไบต์
+local function utf8Len(str)
+    local n = 0
+    for i = 1, #str do
+        local b = str:byte(i)
+        if b < 0x80 or b >= 0xC0 then
+            n = n + 1
+        end
+    end
+    return n
+end
+
 -- ════════════════════════════════════════════
 --  SUGGESTION ENGINE
 -- ════════════════════════════════════════════
@@ -107,14 +172,24 @@ local function getSuggestions(prefix)
     local bucket = WORD_DB[fc]
     if not bucket then return out end
 
+    local minChars = CFG.MIN_SUGGEST_CHARS
+
     for _, w in ipairs(bucket) do
-        -- เปลี่ยน #w >= 9 เป็น #w >= 15 เพื่อบังคับหาคำที่ยาวขึ้น
-        if #w > plen and #w >= 18 and w:sub(1, plen) == prefix and not blacklisted[w] then
+        if #w > plen and w:sub(1, plen) == prefix and not blacklisted[w] and utf8Len(w) >= minChars then
             table.insert(out, w)
         end
     end
 
-    table.sort(out, function(a, b) return #a < #b end)
+    -- เรียงคำที่ "คนรู้จักเยอะกว่า" (ความถี่ใน TNC สูงกว่า) ไว้ก่อน
+    -- ถ้าความถี่เท่ากัน (หรือไม่มีข้อมูลความถี่เลย) ให้คำที่สั้นกว่ามาก่อนเหมือนเดิม
+    table.sort(out, function(a, b)
+        local fa = WORD_FREQ[a] or 0
+        local fb = WORD_FREQ[b] or 0
+        if fa ~= fb then
+            return fa > fb
+        end
+        return #a < #b
+    end)
 
     local result = {}
     for i = 1, math.min(#out, CFG.MAX_SUGGEST) do
@@ -144,6 +219,8 @@ local COLORS = {
     rst_bg    = Color3.fromHex("101E1A"),
     rst_txt   = Color3.fromHex("4CFFE8"),
     lastchar  = Color3.fromHex("FFB347"),
+    set_bg    = Color3.fromHex("14181C"),
+    set_txt   = Color3.fromHex("AEB4BA"),
 }
 
 -- ลบ UI เก่าทิ้งถ้ามี
@@ -278,7 +355,7 @@ local function makeIconButton(iconAssetId, fallbackText, bgColor, iconColor, ord
     btn.Visible          = false
     btn.Parent           = island
     Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
-    
+
     local btnScale = Instance.new("UIScale", btn)
 
     local stroke = Instance.new("UIStroke", btn)
@@ -322,8 +399,26 @@ local function makeIconButton(iconAssetId, fallbackText, bgColor, iconColor, ord
     return btn, btnScale
 end
 
-local resetBtn, resetScale   = makeIconButton("rbxassetid://10747373176", "↺", COLORS.rst_bg, COLORS.rst_txt, 3)
-local removeBtn, removeScale = makeIconButton("rbxassetid://10747384394", "✕", COLORS.del_bg, COLORS.del_txt, 4)
+-- ตัวปรับความยาวคำขั้นต่ำ (แสดงตลอดเวลา ไม่ผูกกับสถานะมีคำ/ไม่มีคำ)
+local lenMinusBtn, lenMinusScale = makeIconButton("", "-", COLORS.set_bg, COLORS.set_txt, 3)
+lenMinusBtn.Visible = true
+
+local lenLabel = Instance.new("TextLabel")
+lenLabel.Size              = UDim2.new(0, 20, 0, 34)
+lenLabel.BackgroundTransparency = 1
+lenLabel.Font              = Enum.Font.GothamBold
+lenLabel.TextSize          = 14
+lenLabel.TextColor3        = COLORS.text
+lenLabel.TextXAlignment    = Enum.TextXAlignment.Center
+lenLabel.Text              = tostring(CFG.MIN_SUGGEST_CHARS)
+lenLabel.LayoutOrder       = 4
+lenLabel.Parent            = island
+
+local lenPlusBtn, lenPlusScale = makeIconButton("", "+", COLORS.set_bg, COLORS.set_txt, 5)
+lenPlusBtn.Visible = true
+
+local resetBtn, resetScale   = makeIconButton("rbxassetid://10747373176", "↺", COLORS.rst_bg, COLORS.rst_txt, 6)
+local removeBtn, removeScale = makeIconButton("rbxassetid://10747384394", "✕", COLORS.del_bg, COLORS.del_txt, 7)
 
 -- ════════════════════════════════════════════
 --  DISPLAY / PULSE / ANIMATION
@@ -409,11 +504,27 @@ local function doReset()
     pulse(resetScale)
 end
 
+local function setMinSuggestChars(delta)
+    CFG.MIN_SUGGEST_CHARS = math.clamp(CFG.MIN_SUGGEST_CHARS + delta, 1, 15)
+    lenLabel.Text = tostring(CFG.MIN_SUGGEST_CHARS)
+    if lastWord ~= "" and lastWord ~= "__none__" then
+        refreshSuggestions(lastWord)
+    end
+end
+
 -- ════════════════════════════════════════════
 --  INPUT HANDLERS (BUTTONS & HOTKEYS)
 -- ════════════════════════════════════════════
 removeBtn.MouseButton1Click:Connect(doRemove)
 resetBtn.MouseButton1Click:Connect(doReset)
+lenMinusBtn.MouseButton1Click:Connect(function()
+    setMinSuggestChars(-1)
+    pulse(lenMinusScale)
+end)
+lenPlusBtn.MouseButton1Click:Connect(function()
+    setMinSuggestChars(1)
+    pulse(lenPlusScale)
+end)
 
 UIS.InputBegan:Connect(function(input, gameProcessedEvent)
     -- ลบเงื่อนไข if gameProcessedEvent then return end ออก
@@ -505,4 +616,4 @@ task.spawn(function()
     end
 end)
 
-print("[WC Helper] v2.8+ | Updated UI & Keybinds | PyThaiNLP | online")
+print("[WC Helper] v2.9 | Thai-only filter + common-word sort + length stepper | PyThaiNLP + TNC | online")
