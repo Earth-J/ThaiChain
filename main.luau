@@ -383,6 +383,7 @@ local function doAutoFill()
 
                     if myCycle == currentTypeCycle then
                         task.wait(0.1) 
+                        task.wait(3)
                         VIM:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
                         task.wait(0.05)
                         VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
